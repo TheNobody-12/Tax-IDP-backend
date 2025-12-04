@@ -8,3 +8,4 @@ venv/
 *.pyo
 *.DS_Store
 
+clear_db.py
