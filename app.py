@@ -539,8 +539,10 @@ async def get_document_silver_csv(doc_id: str):
 
     pages = silver.get("pages") or []
     output = io.StringIO()
-    writer = None
-
+    # Collect union of all fieldnames to avoid ValueError on missing keys
+    base_cols = ["DocId", "Page", "Category", "Confidence"]
+    extra_cols: set[str] = set()
+    rows: list[Dict[str, Any]] = []
     for p in pages:
         row: Dict[str, Any] = {
             "DocId": doc_id,
@@ -550,11 +552,14 @@ async def get_document_silver_csv(doc_id: str):
         }
         fields = p.get("extracted_fields") or {}
         row.update(fields)
+        extra_cols.update(k for k in fields.keys() if k not in base_cols)
+        rows.append(row)
 
-        if writer is None:
-            writer = csv.DictWriter(output, fieldnames=list(row.keys()))
-            writer.writeheader()
-        writer.writerow(row)
+    fieldnames = base_cols + sorted(extra_cols)
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({k: row.get(k) for k in fieldnames})
 
     csv_bytes = output.getvalue()
 

@@ -7,6 +7,7 @@ from azure.core.polling import LROPoller
 from src.config.azure_clients import credential, di_endpoint, di_api_version
 
 logger = logging.getLogger(__name__)
+logger.info("[DI] di_extraction module loaded (endpoint=%s api_version=%s)", di_endpoint, di_api_version)
 
 import base64
 from io import BytesIO

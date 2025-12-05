@@ -34,15 +34,13 @@ logger = logging.getLogger(__name__)
 # Attempt to import real DI + silver modules; fallback to placeholders if absent.
 try:
     from src.pipeline.di_extraction import extract_with_azure_di  # type: ignore
+    HAVE_DI = True
+    logger.info("DI client import succeeded")
 except Exception:  # pragma: no cover
+    HAVE_DI = False
     async def extract_with_azure_di(local_file_path: str):  # type: ignore
-        """
-        Placeholder for Azure DI extraction.
-        Returns mock page text and structure for the provided local_file_path.
-        """
-        logger.warning("Using placeholder DI extraction (no Azure DI client).")
-        text = "Placeholder DI content for file"  # single page
-        return [text], [], [None], {"pages": [{"content": text}]}
+        raise RuntimeError("Azure DI client unavailable (import failed)")
+    logger.exception("DI client import failed; DI will be unavailable.")
 
 try:
     from src.pipeline.silver_structured import build_silver_document  # type: ignore
@@ -254,6 +252,8 @@ async def run(
     src_pdf = Path(input_pdf)
     if not src_pdf.exists():
         raise FileNotFoundError(f"Input PDF not found: {src_pdf}")
+    if not HAVE_DI:
+        raise RuntimeError("Azure Document Intelligence unavailable; aborting upload")
 
     doc_id = str(uuid.uuid4())
     set_log_context(doc_id=doc_id)  # propagate correlation id
@@ -348,6 +348,7 @@ async def run(
         "status": "valid" if validation.get("is_valid") else "needs_review",
         "confidence": max((p.get("confidence", 0) for p in silver_doc.get("pages", [])), default=0),
         "llmUsed": silver_doc.get("llm_used", HAVE_LLM),
+        "llm_used": silver_doc.get("llm_used", HAVE_LLM),
         "bronze_pdf_blob": bronze_blob_ref,
         "bronze_di_blob": bronze_di_blob,
         **silver_blob_refs,
