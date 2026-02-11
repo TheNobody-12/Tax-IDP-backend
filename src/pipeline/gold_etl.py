@@ -41,6 +41,10 @@ def upsert_from_silver(meta: Dict[str, Any], silver_doc: Optional[Dict[str, Any]
     bronze_blob = meta.get('bronze_pdf_blob')
     silver_json_blob = meta.get('silver_json_blob')
     silver_pdf_blob = meta.get('silver_pdf_blob')
+    
+    validation_errors = json.dumps(meta.get('validation_errors', []))
+    validation_warnings = json.dumps(meta.get('validation_warnings', []))
+    class_conf = meta.get('classification_confidence')
 
     silver: Optional[Dict[str, Any]] = silver_doc
     if silver is None:
@@ -67,17 +71,23 @@ def upsert_from_silver(meta: Dict[str, Any], silver_doc: Optional[Dict[str, Any]
                 ON target.DocID = src.DocID
                 WHEN MATCHED THEN UPDATE SET
                     ClientID = ?, ClientName = ?, TaxYear = ?, Category = ?, Status = ?, Confidence = ?, LLMUsed = ?,
-                    BronzeBlob = ?, SilverJsonBlob = ?, SilverPdfBlob = ?, RawJsonHash = ?, UpdatedAt = SYSUTCDATETIME()
+                    BronzeBlob = ?, SilverJsonBlob = ?, SilverPdfBlob = ?, RawJsonHash = ?, 
+                    ValidationErrors = ?, ValidationWarnings = ?, ClassificationConfidence = ?,
+                    UpdatedAt = SYSUTCDATETIME()
                 WHEN NOT MATCHED THEN INSERT
                     (DocID, ClientID, ClientName, TaxYear, Category, Status, Confidence, LLMUsed,
-                     BronzeBlob, SilverJsonBlob, SilverPdfBlob, RawJsonHash, CreatedAt, UpdatedAt)
+                     BronzeBlob, SilverJsonBlob, SilverPdfBlob, RawJsonHash, 
+                     ValidationErrors, ValidationWarnings, ClassificationConfidence,
+                     CreatedAt, UpdatedAt)
                 VALUES
-                    (CAST(? AS UNIQUEIDENTIFIER), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, SYSUTCDATETIME(), SYSUTCDATETIME());
+                    (CAST(? AS UNIQUEIDENTIFIER), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, SYSUTCDATETIME(), SYSUTCDATETIME());
                 """,
                 (doc_id, client_id, client_name, tax_year, category, status, confidence, llm_used,
-                 bronze_blob, silver_json_blob, silver_pdf_blob, raw_hash,
+                 bronze_blob, silver_json_blob, silver_pdf_blob, raw_hash, 
+                 validation_errors, validation_warnings, class_conf,
                  doc_id, client_id, client_name, tax_year, category, status, confidence, llm_used,
-                 bronze_blob, silver_json_blob, silver_pdf_blob, raw_hash)
+                 bronze_blob, silver_json_blob, silver_pdf_blob, raw_hash,
+                 validation_errors, validation_warnings, class_conf)
             )
             logger.info(f"[GOLD ETL] Upserted dimDocument DocID={doc_id}")
 

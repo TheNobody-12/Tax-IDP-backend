@@ -26,10 +26,18 @@ from typing import Any, Dict, List, Optional, Callable
 from src.config.app_config import get_config
 from src.config.log_context import set_log_context
 import time
-
 from src.pipeline.db import get_sql_conn
+from src.extraction.base import DocumentContext, PROCESSOR_REGISTRY
+from src.extraction.classifier import DocumentClassifier
+import src.extraction.processors  # Trigger registration
+from src.extraction.clients import get_llm_client
 
 logger = logging.getLogger(__name__)
+
+# Initialize components
+classifier = DocumentClassifier()
+HAVE_LLM = True 
+cfg = get_config()
 
 # Attempt to import real DI + silver modules; fallback to placeholders if absent.
 try:
@@ -38,7 +46,12 @@ try:
     logger.info("DI client import succeeded")
 except Exception:  # pragma: no cover
     HAVE_DI = False
-    async def extract_with_azure_di(local_file_path: str):  # type: ignore
+    from src.pipeline.di_extraction import extract_with_azure_di  # type: ignore
+    HAVE_DI = True
+    logger.info("DI client import succeeded")
+except Exception:  # pragma: no cover
+    HAVE_DI = False
+    async def extract_with_azure_di(local_file_path: str, file_url: str | None = None):  # type: ignore
         raise RuntimeError("Azure DI client unavailable (import failed)")
     logger.exception("DI client import failed; DI will be unavailable.")
 
@@ -84,116 +97,8 @@ except Exception:  # pragma: no cover
     def validate_silver(silver_doc: Dict[str, Any]):  # type: ignore
         return {"is_valid": True, "errors": [], "warnings": []}
 
-# NEW: optional LLM page processor (DI + OCR fusion)
-try:
-    from src.pipeline.llm_processing import process_page_with_llm  # type: ignore
-    HAVE_LLM = True
-except Exception as e:
-    HAVE_LLM = False
-    logger.exception("LLM processing unavailable; falling back to heuristic silver builder. Import failed", exc_info=e)
-
-# NEW: configurable LLM concurrency
-cfg = get_config()
-LLM_MAX_CONCURRENCY = cfg.llm_max_concurrency
-
-# -------------------- Helper functions for LLM silver --------------------
-async def _run_llm_for_pages(
-    page_texts: List[str],
-    page_images_base64: Optional[List[Optional[str]]],
-    tables: Optional[Any],
-    progress_cb: Optional[Callable[[Dict[str, Any]], None]] = None,
-) -> List[Dict[str, Any]]:
-    """Call LLM concurrently for each page (bounded + per-page timeout)."""
-    sem = asyncio.Semaphore(LLM_MAX_CONCURRENCY)
-
-    async def _one(i: int) -> Dict[str, Any]:
-        async with sem:
-            try:
-                return await asyncio.wait_for(
-                    process_page_with_llm(
-                        page_text=page_texts[i],
-                        page_image_base64=(page_images_base64[i] if page_images_base64 and i < len(page_images_base64) else None),
-                        page_number=i + 1,
-                        tables=tables,
-                    ),
-                    timeout=cfg.llm_page_timeout,
-                )
-            except asyncio.TimeoutError:
-                return {"page_number": i + 1, "status": "timeout", "category": None, "confidence": 0.0, "extracted_fields": {}, "error": "LLM timeout", "llm_used": True}
-            finally:
-                if progress_cb:
-                    progress_cb({"pages_done": i + 1})
-    tasks = [asyncio.create_task(_one(i)) for i in range(len(page_texts))]
-    return await asyncio.gather(*tasks)
-
-def _majority_category_and_conf(page_results: List[Dict[str, Any]]) -> tuple[str, float]:
-    cats: List[str] = []
-    confs: List[float] = []
-    for pr in page_results:
-        if pr.get("status") == "ok" and pr.get("category"):
-            cats.append(str(pr["category"]))
-            try:
-                confs.append(float(pr.get("confidence") or 0.0))
-            except Exception:
-                confs.append(0.0)
-    if not cats:
-        return "Other documents", 0.0
-    # majority vote; tie => first
-    majority = max(set(cats), key=cats.count)
-    max_conf = max(confs) if confs else 0.0
-    return majority, max_conf
-
-PRESCRIPTION_ID_PATTERNS = [r"\bN\d{5,6}\b", r"\bRX[:#]?\s?(\w+)", r"\b\d{6,7}\b"]
-
-async def _build_silver_with_llm(
-    doc_id: str,
-    page_texts: List[str],
-    page_images_base64: Optional[List[Optional[str]]],
-    tables: Optional[Any],
-    tax_year: Optional[int],
-    progress_cb: Optional[Callable[[Dict[str, Any]], None]] = None,
-) -> Dict[str, Any]:
-    # Only per-page LLM calls (batch removed)
-    page_results = await _run_llm_for_pages(page_texts, page_images_base64, tables, progress_cb=progress_cb)
-
-    overall_category, overall_conf = _majority_category_and_conf(page_results)
-
-    silver_pages: List[Dict[str, Any]] = []
-    for idx, pr in enumerate(page_results):
-        fields = pr.get("extracted_fields") or {}
-        cat = (pr.get("category") or "").lower()
-        # Inject PrescriptionId / IsPrescription for medical pages if missing
-        if "medical" in cat and "PrescriptionId" not in fields:
-            text = page_texts[idx] if idx < len(page_texts) else ""
-            for pattern in PRESCRIPTION_ID_PATTERNS:
-                m = re.search(pattern, text, flags=re.IGNORECASE)
-                if m:
-                    pid = m.group(1) if m.lastindex else m.group(0)
-                    fields["PrescriptionId"] = pid
-                    fields.setdefault("IsPrescription", True)
-                    break
-        silver_pages.append(
-            {
-                "page_number": pr.get("page_number"),
-                "status": pr.get("status"),
-                "category": pr.get("category") or overall_category,
-                "confidence": pr.get("confidence", 0.0),
-                "extracted_fields": fields,
-                "error": pr.get("error"),
-                "llm_used": pr.get("llm_used", True),
-            }
-        )
-
-    silver_doc: Dict[str, Any] = {
-        "doc_id": doc_id,
-        "category": overall_category,
-        "tax_year": tax_year,
-        "confidence": overall_conf,
-        "pages": silver_pages,
-        "llm_used": True,
-    }
-
-    return silver_doc
+# Legacy LLM helpers removed.
+# The new system uses specialized processors for each document type.
 
 # -------------------- Existing bronze helpers --------------------
 
@@ -227,13 +132,14 @@ def _write_di_json(doc_id: str, di_raw: Any, page_texts: list[str]) -> Path:
 
 
 try:
-    from src.pipeline.azure_storage import upload_bronze_pdf, upload_silver_artifacts, upload_bronze_di
+    from src.pipeline.azure_storage import upload_bronze_pdf, upload_silver_artifacts, upload_bronze_di, generate_blob_sas_url
     HAVE_BLOB = True
 except Exception:
     HAVE_BLOB = False
     async def upload_bronze_pdf(doc_id: str, local_pdf: str): return None
     async def upload_silver_artifacts(doc_id: str, silver_doc: Dict[str, Any], local_pdf: str, client_id: str | None, tax_year: int | None): return {}
     async def upload_bronze_di(doc_id: str, di_doc: Dict[str, Any]): return None
+    async def generate_blob_sas_url(container: str, blob_name: str, expiry_minutes: int = 60): return None
 
 try:
     from src.pipeline.gold_etl import upsert_from_silver
@@ -247,6 +153,7 @@ async def run(
     tax_year: int | None = None,
     generate_gold: bool = False,
     progress_cb: Optional[Callable[[Dict[str, Any]], None]] = None,
+    llm_provider: str = "azure",
 ) -> Dict[str, Any]:
     """Execute pipeline (DI + optional LLM) for a single PDF (async)."""
     src_pdf = Path(input_pdf)
@@ -266,11 +173,26 @@ async def run(
         except Exception as e:
             logger.warning(f"Bronze blob upload failed: {e}", extra={"doc_id": doc_id})
 
+    bronze_blob_sas = None
+    if HAVE_BLOB and bronze_blob_ref:
+        try:
+             # bronze_blob_ref is convention "container:path" or just "container:path" returned by upload?
+             # upload_bronze_pdf returns f"{_BRONZE_CONTAINER}:{blob_path}"
+             # We need just the blob path.
+             blob_name = f"{doc_id}/document.pdf"
+             bronze_container = cfg.bronze_container # Or from azure_storage const if exposed, but config is safer
+             bronze_blob_sas = await generate_blob_sas_url(bronze_container, blob_name)
+             logger.info(f"Generated SAS URL for DI processing: {bronze_blob_sas.split('?')[0]}?...")
+        except Exception as e:
+            logger.warning(f"Failed to generate SAS URL: {e}")
+
     di_attempts = 2
     for attempt in range(1, di_attempts + 1):
         try:
-            page_texts, tables, page_images_base64, di_raw = await asyncio.wait_for(
-                extract_with_azure_di(str(src_pdf)),
+            # Updated: extract_with_azure_di now accepts file_url
+            # If we have a SAS URL, use it. Otherwise fall back to local file.
+            page_texts, tables, page_images_base64, di_raw, markdown_content = await asyncio.wait_for(
+                extract_with_azure_di(str(src_pdf), file_url=bronze_blob_sas),
                 timeout=cfg.di_timeout,
             )
             break
@@ -295,17 +217,105 @@ async def run(
         logger.warning(f"DI JSON upload failed: {e}", extra={"doc_id": doc_id})
 
     if HAVE_LLM:
-        completed = {"count": 0}
+        output_dir = str(Path(AZURE_BRONZE_CONTAINER) / doc_id)
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # 0. Initialize LLM Client
+        ai_client = get_llm_client(provider=llm_provider)
+        logger.info(f"Using LLM provider: {llm_provider} for document {doc_id}")
 
-        def _progress(update: Dict[str, Any]):
-            completed["count"] = max(completed["count"], update.get("pages_done", 0))
-            if progress_cb:
-                progress_cb({"status": "running", "message": "LLM extracting", "pages_done": completed["count"], "pages_total": len(page_texts)})
+        # 1. Classify Directly
+        classification = await classifier.classify(markdown_content, ai_client=ai_client)
+        # classification.category is now a string (dynamic)
+        logger.info(f"Document {doc_id} classified as {classification.category} ({classification.confidence:.2f})")
+        
+        # 2. Select Processor
+        processor_name = classification.processor_name
+        processor = PROCESSOR_REGISTRY.get(processor_name) or PROCESSOR_REGISTRY.get("slips")
+        
+        # 3. Create context for medallion architecture
+        context = DocumentContext(
+            doc_id=doc_id,
+            pdf_path=str(src_pdf),
+            markdown_path=None,
+            markdown_content=markdown_content,
+            total_pages=len(page_texts),
+            metadata={
+                "classification": {
+                    "category": classification.category,
+                    "confidence": classification.confidence,
+                    "reasoning": classification.reasoning
+                },
+                "client_id": client_id,
+                "tax_year": tax_year
+            }
+        )
+        
+        # 4. Extract (Silver Generation)
+        logger.info(f"Running processor {processor.name} for {doc_id}")
+        extraction_result = await processor.process(context, output_dir, ai_client=ai_client)
+        
+        # 5. Format Silver Doc
+        silver_pages = []
+        for i, txt in enumerate(page_texts):
+            # Extract items belonging to this page
+            current_page = i + 1
+            page_items = []
+            for item in extraction_result.data:
+                p_nums = item.get("page_numbers")
+                if not p_nums:
+                    if i == 0: 
+                        page_items.append(item)
+                    continue
+                
+                # Safe check
+                if isinstance(p_nums, list):
+                    if any(int(p) == current_page for p in p_nums if str(p).isdigit()):
+                        page_items.append(item)
+                elif int(p_nums) == current_page: # Fallback if single value
+                     page_items.append(item)
+            
+            # Map to legacy silver page format for downstream compatibility
+            silver_pages.append({
+                "page_number": i + 1,
+                "status": "ok",
+                "category": classification.category,
+                "confidence": classification.confidence,
+                "extracted_fields": page_items[0] if page_items else {},
+                "extracted_data": page_items,
+                "error": None,
+                "llm_used": True
+            })
 
-        silver_doc = await _build_silver_with_llm(doc_id, page_texts, page_images_base64, tables, tax_year, progress_cb=_progress)  # type: ignore
-    else:
-        raise RuntimeError("LLM processing unavailable")
+    # Calculate aggregate extraction confidence from results if available
+    # If no confidence in items, fallback to classification confidence
+    all_item_confidences = []
+    for item in extraction_result.data:
+        c = item.get("confidence")
+        if c is not None:
+            try:
+                all_item_confidences.append(float(c))
+            except (ValueError, TypeError):
+                pass
+    
+    avg_extraction_conf = (sum(all_item_confidences) / len(all_item_confidences)) if all_item_confidences else classification.confidence
 
+    silver_doc = {
+        "doc_id": doc_id,
+        "client_id": client_id,
+        "category": classification.category,
+        "tax_year": tax_year,
+        "confidence": avg_extraction_conf,
+        "classification_confidence": classification.confidence,
+        "pages": silver_pages,
+        "extraction_metadata": {
+            "processor": extraction_result.processor_name,
+            "items_count": extraction_result.items_extracted,
+            "errors": extraction_result.errors
+        },
+        "llm_used": True,
+    }
+    
     validation = validate_silver(silver_doc)
 
     gold_summary = None
@@ -345,8 +355,11 @@ async def run(
         "client_name": client_name,
         "tax_year": tax_year,
         "category": silver_doc.get("category"),
-        "status": "valid" if validation.get("is_valid") else "needs_review",
-        "confidence": max((p.get("confidence", 0) for p in silver_doc.get("pages", [])), default=0),
+        "status": validation.get("status", "needs_review"),
+        "confidence": avg_extraction_conf,
+        "classification_confidence": classification.confidence,
+        "validation_errors": validation.get("errors", []),
+        "validation_warnings": validation.get("warnings", []),
         "llmUsed": silver_doc.get("llm_used", HAVE_LLM),
         "llm_used": silver_doc.get("llm_used", HAVE_LLM),
         "bronze_pdf_blob": bronze_blob_ref,
@@ -360,15 +373,13 @@ async def run(
         except Exception as e:
             logger.warning(f"Gold ETL failed: {e}", extra={"doc_id": doc_id})
 
-    result: Dict[str, Any] = {
-        "doc_id": doc_id,
+    result = {
         "meta": meta,
-        "silver_path": silver_blob_refs.get("silver_json_blob"),
-        "bronze_pdf_path": bronze_blob_ref,
-        "validation": validation,
+        "silver": silver_doc
     }
-    if gold_summary is not None:
-        result["gold_summary"] = gold_summary
+
+    if progress_cb:
+        progress_cb({"status": "completed", "message": "Completed", "pages_done": len(page_texts), "pages_total": len(page_texts)})
 
     logger.info("[PIPELINE] Complete", extra={"doc_id": doc_id})
     return result

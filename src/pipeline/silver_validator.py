@@ -338,7 +338,14 @@ def _soft_validate_generic(fields: Dict[str, Any], errors: List[str], warnings: 
         amt = _clean_amount_like(val)
         norm_box_values[str(box)] = amt if amt is not None else val
 
-    if not norm_box_values:
+    # Only warn if it looks like a slip but has no boxes
+    # "Other documents" includes receipts, invoices, etc. which naturally have no boxes.
+    looks_like_slip = any(
+        term in slip_type.lower() or term in str(fields.get("category_guess", "")).lower()
+        for term in ["slip", "t4", "t5", "t3", "t2202", "rc62", "tax", "relevé", "statement"]
+    )
+
+    if not norm_box_values and looks_like_slip:
         warnings.append("Generic slip: no 'box_values' found; data may be incomplete.")
 
     return {
@@ -489,3 +496,9 @@ def validate_silver_document(silver_obj: Any) -> SilverValidationResult:
     )
 
     return result
+def validate_silver(silver_obj: Any) -> Dict[str, Any]:
+    """Alias for validate_silver_document returning a dict for legacy compatibility."""
+    res = validate_silver_document(silver_obj)
+    d = res.to_dict()
+    d["is_valid"] = (res.status == "valid")
+    return d

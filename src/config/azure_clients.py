@@ -104,8 +104,9 @@ else:
         azure_ad_token_provider=_aad_token_provider,
     )
 
-# Expose deployment name so the rest of the pipeline can use it
+# Expose deployment names so the rest of the pipeline can use it
 openai_deployment_name: str = openai_deployment
+openai_deployment_fast: str = os.getenv("AZURE_OPENAI_DEPLOYMENT_FAST") or openai_deployment
 
 # --------------------------------------------------------------------
 # Azure Document Intelligence client – SINGLE async client

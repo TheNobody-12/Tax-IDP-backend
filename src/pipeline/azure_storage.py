@@ -3,8 +3,9 @@ import os, json, logging, asyncio
 from pathlib import Path
 from typing import Dict, Any, Optional
 from azure.storage.blob.aio import BlobServiceClient
-from azure.storage.blob import ContentSettings
+from azure.storage.blob import ContentSettings, generate_blob_sas, BlobSasPermissions
 from azure.core.exceptions import AzureError
+from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
@@ -154,3 +155,63 @@ async def _retry_upload(bc, data: bytes, attempts: int = 5, base_delay: float = 
                 pass
     if last_err:
         raise last_err
+
+
+async def delete_document_blobs(doc_id: str, category: str | None, client_id: str | None, tax_year: int | None):
+    """Delete all blobs associated with a document (Bronze & Silver)."""
+    async with await _client() as bs:
+        # Bronze
+        for blob_path in [_bronze_blob_path(doc_id), _bronze_di_blob_path(doc_id)]:
+            try:
+                await bs.get_blob_client(_BRONZE_CONTAINER, blob_path).delete_blob()
+                logger.info(f"[STORAGE] Deleted bronze blob {_BRONZE_CONTAINER}/{blob_path}")
+            except Exception as e:
+                logger.warning(f"[STORAGE] Failed to delete bronze blob {blob_path}: {e}")
+
+        # Silver
+        paths = silver_blob_paths(doc_id, category, client_id, tax_year)
+        for key, blob_path in paths.items():
+            try:
+                await bs.get_blob_client(_SILVER_CONTAINER, blob_path).delete_blob()
+                logger.info(f"[STORAGE] Deleted silver blob {_SILVER_CONTAINER}/{blob_path}")
+            except Exception as e:
+                logger.warning(f"[STORAGE] Failed to delete silver blob {blob_path}: {e}")
+
+async def generate_blob_sas_url(container: str, blob_name: str, expiry_minutes: int = 60) -> str:
+    """Generate a read-only SAS URL for a blob."""
+    if not _ACCOUNT_CONN:
+        raise ValueError("Storage connection string not set")
+    
+    # Parse connection string manually to avoid client overhead for SAS gen
+    # Quick hack: assume standard conn string format
+    kv = dict(item.split('=', 1) for item in _ACCOUNT_CONN.split(';') if item)
+    account_name = kv.get('AccountName')
+    account_key = kv.get('AccountKey')
+
+    if not account_name or not account_key:
+        # Fallback to loading client if complex conn string (e.g. emulator)
+        # But generate_blob_sas needs key. If emulator, it's well known.
+        raise ValueError("Could not parse AccountName/AccountKey from connection string")
+
+    sas_token = generate_blob_sas(
+        account_name=account_name,
+        container_name=container,
+        blob_name=blob_name,
+        account_key=account_key,
+        permission=BlobSasPermissions(read=True),
+        expiry=datetime.utcnow() + timedelta(minutes=expiry_minutes)
+    )
+    
+    # Construct URL
+    # Handle emulator specific URL construction if needed, but assuming standard Azure for now:
+    # https://<account>.blob.core.windows.net/<container>/<blob>?<sas>
+    # If emulator: http://127.0.0.1:10000/<account>/<container>/<blob>?<sas>
+    
+    if "127.0.0.1" in _ACCOUNT_CONN or "localhost" in _ACCOUNT_CONN:
+        # Emulator format guess
+        blob_url = f"http://127.0.0.1:10000/{account_name}/{container}/{blob_name}"
+    else:
+        blob_endpoint = kv.get('BlobEndpoint', f"https://{account_name}.blob.core.windows.net")
+        blob_url = f"{blob_endpoint}/{container}/{blob_name}"
+
+    return f"{blob_url}?{sas_token}"

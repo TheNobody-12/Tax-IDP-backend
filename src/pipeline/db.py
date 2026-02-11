@@ -10,8 +10,11 @@ from __future__ import annotations
 
 import os
 import logging
-
 import pyodbc
+import dotenv
+
+# Ensure .env is loaded before accessing global variables, allowing overrides for local dev
+dotenv.load_dotenv(dotenv.find_dotenv(), override=True)
 
 logger = logging.getLogger(__name__)
 
@@ -41,28 +44,37 @@ def _parse_conn_str(conn: str) -> dict:
 
 
 def _build_conn_info() -> dict:
+    # Fetch variables at runtime to support dynamic updates (e.g., uvicorn reload)
+    sql_conn_str = os.getenv("SQL_CONN_STR")
+    def_server = os.getenv("SQL_SERVER")
+    def_db = os.getenv("SQL_DATABASE")
+    def_uid = os.getenv("SQL_USERNAME")
+    def_pwd = os.getenv("SQL_PASSWORD")
+    def_driver = os.getenv("SQL_DRIVER", "ODBC Driver 17 for SQL Server")
+
     conn = None
-    if _SQL_CONN_STR:
-        conn = "".join(line.strip() for line in _SQL_CONN_STR.splitlines())
+    if sql_conn_str:
+        conn = "".join(line.strip() for line in sql_conn_str.splitlines())
         logger.info("Using SQL_CONN_STR env for database connection.")
         kv = _parse_conn_str(conn)
         server = kv.get("SERVER") or kv.get("DATA SOURCE")
         database = kv.get("DATABASE") or kv.get("INITIAL CATALOG")
         uid = kv.get("UID") or kv.get("USER ID")
         pwd = kv.get("PWD") or kv.get("PASSWORD")
-        driver = kv.get("DRIVER") or _DEF_DRIVER
+        driver = kv.get("DRIVER") or def_driver
         encrypt = kv.get("ENCRYPT", "yes").lower() in ("yes", "true", "1")
         trust = kv.get("TRUSTSERVERCERTIFICATE", "no").lower() in ("yes", "true", "1")
+        logger.info(f"Using SQL_CONN_STR for database connection (Server: {server}, DB: {database}, Driver: {driver})")
     else:
         missing = [k for k, v in {
-            'SQL_SERVER': _DEF_SERVER,
-            'SQL_DATABASE': _DEF_DB,
-            'SQL_USERNAME': _DEF_UID,
-            'SQL_PASSWORD': _DEF_PWD,
+            'SQL_SERVER': def_server,
+            'SQL_DATABASE': def_db,
+            'SQL_USERNAME': def_uid,
+            'SQL_PASSWORD': def_pwd,
         }.items() if not v]
         if missing:
             raise RuntimeError(f"Missing SQL env vars: {', '.join(missing)}")
-        server, database, uid, pwd, driver = _DEF_SERVER, _DEF_DB, _DEF_UID, _DEF_PWD, _DEF_DRIVER
+        server, database, uid, pwd, driver = def_server, def_db, def_uid, def_pwd, def_driver
         encrypt, trust = SQL_ENCRYPT, SQL_TRUST_CERT
         conn = (
             f"DRIVER={{{driver}}};"
@@ -141,3 +153,58 @@ def get_sql_conn():
     info = _build_conn_info()
     logger.debug("Connecting to SQL Server via pyodbc %s / %s", info["server"], info["database"])
     return pyodbc.connect(info["conn_str"], timeout=SQL_TIMEOUT)
+
+
+def ensure_schema():
+    """Ensure required database schema exists (e.g. gold.ProcessorConfig)."""
+    if not SQL_ENABLED:
+        return
+    
+    sql = """
+    IF NOT EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[gold].[ProcessorConfig]') AND type in (N'U'))
+    BEGIN
+        CREATE TABLE [gold].[ProcessorConfig](
+            [ProcessorID] [int] IDENTITY(1,1) NOT NULL,
+            [Name] [varchar](100) NOT NULL UNIQUE,
+            [DisplayName] [varchar](100) NULL,
+            [Description] [nvarchar](max) NULL,
+            [SystemPrompt] [nvarchar](max) NULL,
+            [UserPrompt] [nvarchar](max) NULL,
+            [SchemaDefinition] [nvarchar](max) NULL,
+            [Enabled] [bit] DEFAULT 1,
+            [IsSystem] [bit] DEFAULT 0,
+            [CreatedAt] [datetime] DEFAULT GETUTCDATE(),
+            [UpdatedAt] [datetime] DEFAULT GETUTCDATE(),
+            PRIMARY KEY CLUSTERED ([ProcessorID] ASC)
+        );
+    END
+
+    -- Ensure dimDocument has validation columns
+    IF EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'[gold].[dimDocument]') AND type in (N'U'))
+    BEGIN
+        IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[gold].[dimDocument]') AND name = 'ValidationErrors')
+        BEGIN
+            ALTER TABLE [gold].[dimDocument] ADD [ValidationErrors] [nvarchar](max) NULL;
+        END
+        IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[gold].[dimDocument]') AND name = 'ValidationWarnings')
+        BEGIN
+            ALTER TABLE [gold].[dimDocument] ADD [ValidationWarnings] [nvarchar](max) NULL;
+        END
+        IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID(N'[gold].[dimDocument]') AND name = 'ClassificationConfidence')
+        BEGIN
+            ALTER TABLE [gold].[dimDocument] ADD [ClassificationConfidence] [float] NULL;
+        END
+    END
+    """
+    conn = get_sql_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            conn.commit()
+        logger.info("[DB] Schema verification complete (gold.ProcessorConfig ensured)")
+    except Exception as e:
+        logger.error(f"[DB] Schema verification failed: {e}")
+        # We don't raise here to allow app to start even if SQL is partially broken, 
+        # but features relying on this table will fail later.
+    finally:
+        conn.close()

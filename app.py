@@ -22,7 +22,8 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
+from pydantic import BaseModel, Field
 from datetime import datetime
 from threading import Lock
 import uuid
@@ -37,21 +38,26 @@ from starlette.concurrency import run_in_threadpool
 # Import the local no-SQL pipeline
 try:
     from src.pipeline.process_document import run as run_pipeline
+    from src.pipeline.db import get_sql_conn, ensure_schema
     from src.pipeline.db import get_sql_conn
-    from src.pipeline.azure_storage import download_blob_json, move_silver_category, upload_silver_json
+    from src.pipeline.azure_storage import download_blob_json, move_silver_category, upload_silver_json, delete_document_blobs
     from src.pipeline.gold_etl import upsert_from_silver
     HAVE_GOLD_ETL = True
     HAVE_BLOB = True
 except Exception:
-    # Fallback relative import depending on how PYTHONPATH is set
-    from .src.pipeline.process_document import run as run_pipeline  # type: ignore
-    from .src.pipeline.db import get_sql_conn  # type: ignore
-    HAVE_BLOB = False
+    # If the first import fails, it means we can't load the pipeline code.
+    # Relative imports from top level will fail.
+    # We should just let the first import log or re-raise if needed, but for now, 
+    # we'll assume valid python path or failures mean features are disabled.
+    from src.pipeline.process_document import run as run_pipeline
+    from src.pipeline.db import get_sql_conn
     HAVE_GOLD_ETL = False
+    HAVE_BLOB = False
 
     async def download_blob_json(container: str, blob: str): return None
     async def move_silver_category(doc_id: str, old_category: str | None, new_category: str, client_id: str | None, tax_year: int | None): return {}
     async def upload_silver_json(blob_ref: str, silver_doc: Dict[str, Any]): return None
+    async def delete_document_blobs(doc_id: str, category: str | None, client_id: str | None, tax_year: int | None): return None
     def upsert_from_silver(meta: Dict[str, Any], silver_doc=None): return None
 
 try:
@@ -109,20 +115,49 @@ def _redact(value: Any) -> str:
 
 app = FastAPI(title="Bookkeeper API", version="1.0.0")
 
-# CORS: allow specific origins when provided; default to permissive (legacy)
-allowed_origins = os.getenv("ALLOWED_ORIGINS")
-if allowed_origins:
-    origins = [o.strip() for o in allowed_origins.split(",") if o.strip()]
+# Security: tightened CORS for production
+allowed_origins_str = os.getenv("ALLOWED_ORIGINS", "")
+if allowed_origins_str:
+    allowed_origins = [o.strip() for o in allowed_origins_str.split(",") if o.strip()]
 else:
-    origins = ["*"]
+    # Fallback to localhost for dev if not set
+    allowed_origins = [
+        "http://localhost:3000", 
+        "http://127.0.0.1:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5174",
+    ]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Global Error Handlers
+from fastapi.exceptions import RequestValidationError
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    logger.error(f"Validation error: {exc.errors()}", extra={"path": request.url.path})
+    return JSONResponse(
+        status_code=422,
+        content={"detail": exc.errors(), "message": "Validation failed"}
+    )
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.exception(f"Unhandled error: {str(exc)}", extra={"path": request.url.path})
+    return JSONResponse(
+        status_code=500,
+        content={"message": "An internal server error occurred", "doc_id": getattr(exc, "doc_id", None)}
+    )
 
 _edit_lock = Lock()
 _job_lock = Lock()
@@ -219,7 +254,12 @@ def _load_meta_from_db(doc_id: str) -> Dict[str, Any] | None:
         conn = get_sql_conn()
         cur = conn.cursor()
         _apply_cursor_timeout(cur)
-        cur.execute("SELECT DocID, ClientID, ClientName, TaxYear, Category, Status, Confidence, LLMUsed, BronzeBlob, SilverJsonBlob, SilverPdfBlob FROM gold.dimDocument WHERE DocID = ?", (doc_id,))
+        cur.execute("""
+            SELECT DocID, ClientID, ClientName, TaxYear, Category, Status, Confidence, LLMUsed, 
+                   BronzeBlob, SilverJsonBlob, SilverPdfBlob,
+                   ValidationErrors, ValidationWarnings, ClassificationConfidence
+            FROM gold.dimDocument WHERE DocID = ?
+        """, (doc_id,))
         r = cur.fetchone()
         conn.close()
         if not r:
@@ -232,6 +272,9 @@ def _load_meta_from_db(doc_id: str) -> Dict[str, Any] | None:
             "category": getattr(r, 'Category', None),
             "status": getattr(r, 'Status', None),
             "confidence": float(getattr(r, 'Confidence', 0) or 0),
+            "classification_confidence": float(getattr(r, 'ClassificationConfidence', 0) or 0),
+            "validation_errors": json.loads(getattr(r, 'ValidationErrors', '[]') or '[]'),
+            "validation_warnings": json.loads(getattr(r, 'ValidationWarnings', '[]') or '[]'),
             "llm_used": bool(getattr(r, 'LLMUsed', 0)),
             "llmUsed": bool(getattr(r, 'LLMUsed', 0)),
             "bronze_pdf_blob": getattr(r, 'BronzeBlob', None),
@@ -325,7 +368,13 @@ def _load_all_meta() -> List[Dict[str, Any]]:
 
 
 @app.post("/api/documents", status_code=202)
-async def upload_document(background_tasks: BackgroundTasks, file: UploadFile = File(...), client_id: str | None = Form(None), tax_year: int | None = Form(None)):
+async def upload_document(
+    background_tasks: BackgroundTasks, 
+    file: UploadFile = File(...), 
+    client_id: str | None = Form(None), 
+    tax_year: int | None = Form(None),
+    llm_provider: str = Form("azure")
+):
     """
     Upload a PDF and queue the pipeline.
 
@@ -333,6 +382,7 @@ async def upload_document(background_tasks: BackgroundTasks, file: UploadFile = 
     - file: uploaded PDF
     - client_id: optional
     - tax_year: optional (int)
+    - llm_provider: 'azure', 'openai', or 'anthropic' (default: azure)
     """
     if file is None:
         raise HTTPException(status_code=400, detail="Missing file field")
@@ -346,29 +396,33 @@ async def upload_document(background_tasks: BackgroundTasks, file: UploadFile = 
     job_id = str(uuid.uuid4())
     _set_job(job_id, status="queued", message="Waiting to start", doc_id=None, client_id=client_id, tax_year=tax_year, filename=file.filename)
 
-    def _worker():
+    async def _process_pipeline(job_id: str, tmp_path: Path, client_id: Optional[str], tax_year: Optional[int], llm_provider: str):
         set_log_context(job_id=job_id)
         _set_job(job_id, status="running", message="Processing", started_at=str(datetime.now()))
         try:
             def _progress(update: Dict[str, Any]):
                 _set_job(job_id, **update)
-            result = asyncio.run(
-                run_pipeline(
-                    input_pdf=tmp_path,
-                    client_id=client_id,
-                    tax_year=tax_year,
-                    generate_gold=False,
-                    progress_cb=_progress,
-                )
+            
+            result = await run_pipeline(
+                input_pdf=tmp_path,
+                client_id=client_id,
+                tax_year=tax_year,
+                generate_gold=False,
+                progress_cb=_progress,
+                llm_provider=llm_provider
             )
             _metrics['documents_total'] += 1
             _set_job(job_id, status="completed", message="Completed", doc_id=result.get("doc_id"), meta=result.get("meta"))
         except Exception as e:
+            logger.exception("Pipeline failed")
             _metrics['documents_failed'] += 1
-            logger.exception("Upload job failed", extra={"job_id": job_id})
-            _set_job(job_id, status="failed", message=str(e))
+            _set_job(job_id, status="failed", error=str(e))
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink()
+                logger.info(f"Cleaned up temp file {tmp_path}")
 
-    background_tasks.add_task(_worker)
+    background_tasks.add_task(_process_pipeline, job_id, tmp_path, client_id, tax_year, llm_provider)
 
     return {"job_id": job_id, "status": "queued"}
 
@@ -417,7 +471,12 @@ async def list_documents(client_id: str | None = None, tax_year: int | None = No
         conn = get_sql_conn()
         cur = conn.cursor()
         _apply_cursor_timeout(cur)
-        base = "SELECT DocID, ClientID, ClientName, TaxYear, Category, Status, Confidence, LLMUsed, BronzeBlob, SilverJsonBlob, SilverPdfBlob FROM gold.dimDocument"
+        base = """
+            SELECT DocID, ClientID, ClientName, TaxYear, Category, Status, Confidence, LLMUsed, 
+                   BronzeBlob, SilverJsonBlob, SilverPdfBlob,
+                   ValidationErrors, ValidationWarnings, ClassificationConfidence
+            FROM gold.dimDocument
+        """
         where = []
         params = []
         if client_id:
@@ -441,6 +500,9 @@ async def list_documents(client_id: str | None = None, tax_year: int | None = No
                 "category": getattr(r, 'Category', None),
                 "status": getattr(r, 'Status', None),
                 "confidence": float(getattr(r, 'Confidence', 0) or 0),
+                "classification_confidence": float(getattr(r, 'ClassificationConfidence', 0) or 0),
+                "validation_errors": json.loads(getattr(r, 'ValidationErrors', '[]') or '[]'),
+                "validation_warnings": json.loads(getattr(r, 'ValidationWarnings', '[]') or '[]'),
                 "llmUsed": bool(getattr(r, 'LLMUsed', 0)),
                 "bronze_pdf_blob": getattr(r, 'BronzeBlob', None),
                 "silver_json_blob": getattr(r, 'SilverJsonBlob', None),
@@ -564,12 +626,61 @@ async def get_document_silver_csv(doc_id: str):
     csv_bytes = output.getvalue()
 
     return Response(
-        csv_bytes,
+        csv_bytes.encode('utf-8'),
         media_type="text/csv",
         headers={
             "Content-Disposition": f'attachment; filename="silver-{doc_id}.csv"'
         },
     )
+
+
+@app.delete("/api/documents/{doc_id}")
+async def delete_document(doc_id: str):
+    """Delete a document from DB and Storage."""
+    # 1. Get meta to know what blobs to delete
+    meta = await _run_blocking(_load_meta_from_db, doc_id)
+    if not meta:
+        # Fallback if not in DB but maybe in memory or partial state?
+        logger.warning(f"[API] Delete requested for {doc_id} but not found in Gold DB. Proceeding with best effort.")
+        meta = {}
+    
+    # 2. Delete from DB
+    try:
+        def _delete_db():
+            conn = get_sql_conn()
+            cur = conn.cursor()
+            _apply_cursor_timeout(cur)
+            # Cascade delete manually from fact tables
+            cur.execute("DELETE FROM gold.factOtherDocuments WHERE DocID = ?", (doc_id,))
+            # Also try deleting from other known fact tables if they exist (best effort)
+            try:
+                cur.execute("DELETE FROM gold.factMedicalExpenses WHERE DocID = ?", (doc_id,))
+            except Exception:
+                pass
+            
+            # Delete pages
+            cur.execute("DELETE FROM gold.DocumentPage WHERE DocID = ?", (doc_id,))
+            cur.execute("DELETE FROM gold.dimDocument WHERE DocID = ?", (doc_id,))
+            conn.commit()
+            conn.close()
+        await _run_blocking(_delete_db)
+    except Exception as e:
+        logger.error(f"[API] DB deletion failed for {doc_id}: {e}")
+        # Continue to try deleting blobs anyway
+
+    # 3. Delete Blobs
+    if HAVE_BLOB:
+        try:
+            await delete_document_blobs(
+                doc_id, 
+                meta.get("category"), 
+                meta.get("client_id"), 
+                meta.get("tax_year")
+            )
+        except Exception as e:
+            logger.warning(f"[API] Blob deletion failed for {doc_id}: {e}")
+
+    return {"status": "deleted", "doc_id": doc_id}
 
 
 @app.get("/api/documents/other")
@@ -720,14 +831,26 @@ async def _patch_document_status(doc_id: str, payload: Dict[str, Any]):
     return meta
 
 
-VALID_CATEGORIES = {
-    "Slips", "TSlips", "Medical expenses", "Charitable donations", "Political donations", "Child care expenses", "RRSP contribution", "Union and Professional Dues", "Property Tax receipt", "Rent receipt", "Other documents"
-}
+
+# Dynamic category validation
+def get_valid_categories():
+    try:
+        from src.extraction.base import PROCESSOR_REGISTRY
+        # GenericExpenseProcessor uses category.value as display_name
+        # MedicalExpenseProcessor uses "Medical expenses"
+        return {p.display_name for p in PROCESSOR_REGISTRY.get_all()}
+    except Exception:
+        # Fallback if registry not ready
+        return {
+            "Slips", "Medical expenses", "Charitable donations", "Political donations", 
+            "Child care expenses", "RRSP contribution", "Union and Professional Dues", 
+            "Property Tax receipt", "Rent receipt", "Other documents"
+        }
 
 
 async def _patch_document_category(doc_id: str, payload: Dict[str, Any]):
     new_category = payload.get("category")
-    if not new_category or new_category not in VALID_CATEGORIES:
+    if not new_category or new_category not in get_valid_categories():
         raise HTTPException(status_code=400, detail="Invalid category")
     meta = _load_meta(doc_id)
     if meta is None:
@@ -737,6 +860,7 @@ async def _patch_document_category(doc_id: str, payload: Dict[str, Any]):
     if (old_category or "").lower() != "other documents" and not allow_any:
         raise HTTPException(status_code=409, detail="Category override allowed only when current category is 'Other documents'")
     silver = _load_silver(doc_id)
+
     if silver:
         silver["category"] = new_category
         pages = silver.get("pages") or []
@@ -762,6 +886,233 @@ async def _patch_document_category(doc_id: str, payload: Dict[str, Any]):
         except Exception as e:
             logger.warning(f"[API] Gold ETL refresh failed for {doc_id} (category patch): {e}")
     return {"doc_id": doc_id, "category": new_category}
+
+
+# ============================================================================
+# Settings / Processor Configuration API
+# ============================================================================
+
+class ProcessorConfigModel(BaseModel):
+    name: str = Field(..., description="Unique internal name")
+    displayName: Optional[str] = None
+    description: Optional[str] = None
+    systemPrompt: Optional[str] = None
+    userPrompt: Optional[str] = None
+    schemaDefinition: Optional[str] = None  # JSON string
+    enabled: bool = True
+    isSystem: bool = False
+
+class ProcessorUpdateModel(BaseModel):
+    displayName: Optional[str] = None
+    description: Optional[str] = None
+    systemPrompt: Optional[str] = None
+    userPrompt: Optional[str] = None
+    schemaDefinition: Optional[str] = None
+    enabled: Optional[bool] = None
+
+@app.get("/api/settings/processors")
+async def list_processors():
+    """List all configured processors."""
+    def _fetch():
+        conn = get_sql_conn()
+        cur = conn.cursor()
+        _apply_cursor_timeout(cur)
+        cur.execute("""
+            SELECT ProcessorID, Name, DisplayName, Description, SystemPrompt, UserPrompt, SchemaDefinition, Enabled, IsSystem
+            FROM gold.ProcessorConfig
+            ORDER BY DisplayName, Name
+        """)
+        rows = cur.fetchall()
+        conn.close()
+        return [
+            {
+                "id": getattr(r, 'ProcessorID', None),
+                "name": getattr(r, 'Name', None),
+                "displayName": getattr(r, 'DisplayName', None),
+                "description": getattr(r, 'Description', None),
+                "systemPrompt": getattr(r, 'SystemPrompt', None),
+                "userPrompt": getattr(r, 'UserPrompt', None),
+                "schemaDefinition": getattr(r, 'SchemaDefinition', None),
+                "enabled": bool(getattr(r, 'Enabled', False)),
+                "isSystem": bool(getattr(r, 'IsSystem', False)),
+            }
+            for r in rows
+        ]
+    try:
+        return await _run_blocking(_fetch)
+    except Exception as e:
+        logger.warning(f"[API] list_processors failed: {e}")
+        return []
+
+@app.get("/api/settings/processors/{name}")
+async def get_processor(name: str):
+    """Get details for a specific processor."""
+    def _fetch():
+        conn = get_sql_conn()
+        cur = conn.cursor()
+        _apply_cursor_timeout(cur)
+        cur.execute("""
+            SELECT ProcessorID, Name, DisplayName, Description, SystemPrompt, UserPrompt, SchemaDefinition, Enabled, IsSystem
+            FROM gold.ProcessorConfig
+            WHERE Name = ?
+        """, (name,))
+        r = cur.fetchone()
+        conn.close()
+        if not r:
+            return None
+        return {
+            "id": getattr(r, 'ProcessorID', None),
+            "name": getattr(r, 'Name', None),
+            "displayName": getattr(r, 'DisplayName', None),
+            "description": getattr(r, 'Description', None),
+            "systemPrompt": getattr(r, 'SystemPrompt', None),
+            "userPrompt": getattr(r, 'UserPrompt', None),
+            "schemaDefinition": getattr(r, 'SchemaDefinition', None),
+            "enabled": bool(getattr(r, 'Enabled', False)),
+            "isSystem": bool(getattr(r, 'IsSystem', False)),
+        }
+    
+    res = await _run_blocking(_fetch)
+    if not res:
+        raise HTTPException(status_code=404, detail="Processor not found")
+    return res
+
+
+# Try to load dynamic processors on startup
+try:
+    from src.extraction.processors.dynamic import load_dynamic_processors
+    # Run in bg to avoid blocking startup if DB slow
+    # But for now, just try-catch
+    try:
+        # 1. Ensure DB schema exists
+        from src.pipeline.db import ensure_schema
+        ensure_schema()
+        # 2. Seed default processors
+        from src.extraction.processors.dynamic import load_dynamic_processors, seed_system_processors
+        seed_system_processors()
+        # 3. Load dynamic configs
+        load_dynamic_processors()
+        from src.extraction.utils.models_dynamic import clear_model_cache
+    except Exception as e:
+        logger.warning(f"Startup dynamic processor load failed: {e}")
+    def clear_model_cache(name=None): pass
+except ImportError:
+    pass
+
+@app.post("/api/settings/processors")
+async def create_processor(config: ProcessorConfigModel):
+    """Create a new processor configuration."""
+    def _create():
+        conn = get_sql_conn()
+        cur = conn.cursor()
+        _apply_cursor_timeout(cur)
+        try:
+            cur.execute("""
+                INSERT INTO gold.ProcessorConfig (Name, DisplayName, Description, SystemPrompt, UserPrompt, SchemaDefinition, Enabled, IsSystem)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+            """, (config.name, config.displayName, config.description, config.systemPrompt, config.userPrompt, config.schemaDefinition, 1 if config.enabled else 0))
+            conn.commit()
+        except pyodbc.IntegrityError:
+            conn.close()
+            raise HTTPException(status_code=409, detail="Processor with this name already exists")
+        except Exception as e:
+            conn.close()
+            raise e
+        conn.close()
+    
+    await _run_blocking(_create)
+    # Reload registry
+    try:
+        load_dynamic_processors()
+    except Exception as e:
+        logger.warning(f"Reload dynamic processors failed: {e}")
+        
+    clear_model_cache(config.name)
+    return {"status": "created", "name": config.name}
+
+@app.put("/api/settings/processors/{name}")
+async def update_processor(name: str, update: ProcessorUpdateModel):
+    """Update an existing processor."""
+    def _update():
+        conn = get_sql_conn()
+        cur = conn.cursor()
+        _apply_cursor_timeout(cur)
+        
+        # Build dynamic update query
+        fields = []
+        params = []
+        if update.displayName is not None:
+            fields.append("DisplayName = ?")
+            params.append(update.displayName)
+        if update.description is not None:
+            fields.append("Description = ?")
+            params.append(update.description)
+        if update.systemPrompt is not None:
+            fields.append("SystemPrompt = ?")
+            params.append(update.systemPrompt)
+        if update.userPrompt is not None:
+            fields.append("UserPrompt = ?")
+            params.append(update.userPrompt)
+        if update.schemaDefinition is not None:
+            fields.append("SchemaDefinition = ?")
+            params.append(update.schemaDefinition)
+        if update.enabled is not None:
+            fields.append("Enabled = ?")
+            params.append(1 if update.enabled else 0)
+        
+        if not fields:
+            conn.close()
+            return
+            
+        fields.append("UpdatedAt = GETUTCDATE()")
+        
+        sql = f"UPDATE gold.ProcessorConfig SET {', '.join(fields)} WHERE Name = ?"
+        params.append(name)
+        
+        cur.execute(sql, tuple(params))
+        if cur.rowcount == 0:
+            conn.close()
+            raise HTTPException(status_code=404, detail="Processor not found")
+        conn.commit()
+        conn.close()
+
+    await _run_blocking(_update)
+    # Reload registry
+    try:
+        load_dynamic_processors()
+    except Exception as e:
+        logger.warning(f"Reload dynamic processors failed: {e}")
+    
+    # Clear cache for system processors that use dynamic models
+    clear_model_cache(name)
+
+    return {"status": "updated", "name": name}
+
+@app.delete("/api/settings/processors/{name}")
+async def delete_processor(name: str):
+    """Delete a processor (if not system)."""
+    def _delete():
+        conn = get_sql_conn()
+        cur = conn.cursor()
+        _apply_cursor_timeout(cur)
+        
+        # Check if system
+        cur.execute("SELECT IsSystem FROM gold.ProcessorConfig WHERE Name = ?", (name,))
+        row = cur.fetchone()
+        if not row:
+            conn.close()
+            raise HTTPException(status_code=404, detail="Processor not found")
+        if row[0]: # IsSystem is true
+            conn.close()
+            raise HTTPException(status_code=403, detail="Cannot delete system processors")
+            
+        cur.execute("DELETE FROM gold.ProcessorConfig WHERE Name = ?", (name,))
+        conn.commit()
+        conn.close()
+        
+    await _run_blocking(_delete)
+    clear_model_cache(name)
+    return {"status": "deleted", "name": name}
 
 
 def _create_client_sync(payload: Dict[str, Any]):
@@ -848,6 +1199,41 @@ async def get_upload_job(job_id: str):
 async def list_upload_jobs():
     with _job_lock:
         return list(_jobs.values())
+
+
+@app.delete("/api/uploads")
+async def clear_upload_jobs_delete():
+    return await _clear_upload_jobs()
+
+
+@app.post("/api/uploads/clear")
+async def clear_upload_jobs_post():
+    return await _clear_upload_jobs()
+
+
+async def _clear_upload_jobs():
+    """Clear all completed or failed jobs from the in-memory store."""
+    with _job_lock:
+        to_keep = {}
+        for jid, job in _jobs.items():
+            if job.get("status") in ("queued", "running", "uploading"):
+                to_keep[jid] = job
+        _jobs.clear()
+        _jobs.update(to_keep)
+    return {"status": "cleared", "remaining": len(_jobs)}
+
+
+@app.delete("/api/uploads/{job_id}")
+async def delete_upload_job(job_id: str):
+    """Remove a specific job if it is not running."""
+    with _job_lock:
+        if job_id not in _jobs:
+            raise HTTPException(status_code=404, detail="Job not found")
+        job = _jobs[job_id]
+        if job.get("status") in ("queued", "running", "uploading"):
+            raise HTTPException(status_code=400, detail="Cannot delete an active job")
+        del _jobs[job_id]
+    return {"status": "deleted", "job_id": job_id}
 
 
 @app.get("/api/readiness")
