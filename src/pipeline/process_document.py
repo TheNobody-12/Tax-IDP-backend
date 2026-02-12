@@ -217,8 +217,8 @@ async def run(
         logger.warning(f"DI JSON upload failed: {e}", extra={"doc_id": doc_id})
 
     if HAVE_LLM:
-        output_dir = str(Path(AZURE_BRONZE_CONTAINER) / doc_id)
-        os.makedirs(output_dir, exist_ok=True)
+        output_dir = "/tmp"  # output_dir is unused by current processors, using /tmp as placeholder
+        # os.makedirs(output_dir, exist_ok=True) # Skipped per user request
         
         # 0. Initialize LLM Client
         ai_client = get_llm_client(provider=llm_provider)

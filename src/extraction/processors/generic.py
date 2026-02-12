@@ -150,8 +150,13 @@ class GenericExpenseProcessor(BaseProcessor):
         # Use local lock for this request's loop
         rate_limit_lock = asyncio.Lock()
 
+        # Prepare provider logs
+        provider_name = getattr(ai_client, "name", ai_client.__class__.__name__.replace("AIClient", ""))
+
         async def process_chunk(i: int, chunk: SimpleChunk):
             nonlocal client_info
+            
+            logger.info(f"[{provider_name}] Starting extraction for chunk {i}/{len(chunks)}...")
             
             async with results_lock:
                  prior_context = f"Found {len(all_items)} items so far." if all_items else ""
@@ -174,6 +179,7 @@ class GenericExpenseProcessor(BaseProcessor):
                 if self.tokens_used_window + chunk_tokens > self.max_input_tokens_per_minute:
                     sleep_time = 60 - (now - self.window_start)
                     if sleep_time > 0:
+                        logger.info(f"[{provider_name}] Rate limit buffer, sleeping {sleep_time:.1f}s")
                         await asyncio.sleep(sleep_time)
                     self.window_start = time.monotonic()
                     self.tokens_used_window = 0
@@ -202,17 +208,20 @@ class GenericExpenseProcessor(BaseProcessor):
                     all_items.extend(result.expenses)
                     if not client_info and result.client_info:
                         client_info = result.client_info
-                logger.debug(f"Chunk {i} complete: {len(result.expenses)} items")
+                logger.info(f"[{provider_name}] Completed chunk {i}/{len(chunks)}. Found {len(result.expenses)} items.")
             else:
+                logger.warning(f"[{provider_name}] Chunk {i}/{len(chunks)} returned no items or failed.")
                 errors.append(f"Chunk {i} failed")
 
-        sem = asyncio.Semaphore(4)
+        sem = asyncio.Semaphore(1) # Reduced for safety with Anthropic
         async def sem_process(i, chunk):
             async with sem:
                 await process_chunk(i, chunk)
         
         tasks = [sem_process(i, chunk) for i, chunk in enumerate(chunks, 1)]
         await asyncio.gather(*tasks)
+        
+        logger.info(f"[{provider_name}] All chunks processed. Total {self._output_name} found: {len(all_items)}")
 
         return ProcessorResult(
             processor_name=self.name,

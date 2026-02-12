@@ -64,8 +64,8 @@ class MedicalExpenseProcessor(BaseProcessor):
         self,
         ai_client: Optional[AzureAIClient] = None,
         model: Optional[str] = None,
-        max_input_tokens_per_minute: int = 200000,
-        min_request_interval: float = 0.2,
+        max_input_tokens_per_minute: int = 25000,
+        min_request_interval: float = 2.0,
         batch_token_threshold: int = 10000,
         max_pages_per_batch: int = 10
     ):
@@ -148,9 +148,12 @@ class MedicalExpenseProcessor(BaseProcessor):
     
         return chunks
     
-    async def process(self, context: DocumentContext, output_dir: str) -> ProcessorResult:
+    async def process(self, context: DocumentContext, output_dir: str, ai_client: Optional[Any] = None) -> ProcessorResult:
         """Process document for medical expenses"""
-        ai_client = self._get_ai_client()
+        if ai_client:
+            self._ai_client = ai_client
+        else:
+            ai_client = self._get_ai_client()
         encoder = self._get_encoder()
         
         # Create chunks using simple token-based batching
@@ -247,13 +250,21 @@ class MedicalExpenseProcessor(BaseProcessor):
         # Run chunks sequentially for medical to maintain context? 
         # Actually, they can run in parallel, but context helps.
         # Let's run with limited concurrency to balance speed and context.
-        sem = asyncio.Semaphore(3)
+        # Identify provider for logging
+        provider_name = self._ai_client.__class__.__name__.replace("AIClient", "")
+
+        sem = asyncio.Semaphore(1)
         async def sem_process(i, chunk):
             async with sem:
-                return await process_single_chunk(i, chunk)
+                logger.info(f"[{provider_name}] Starting extraction for chunk {i}/{len(chunks)}...")
+                count = await process_single_chunk(i, chunk)
+                logger.info(f"[{provider_name}] Completed chunk {i}/{len(chunks)}. Found {count} expenses.")
+                return count
         
         tasks = [sem_process(i, chunk) for i, chunk in enumerate(chunks, 1)]
         await asyncio.gather(*tasks)
+        
+        logger.info(f"[{provider_name}] All chunks processed. Total expenses found: {len(all_expenses)}")
         
         # Post-process
         processed = post_process_expenses(all_expenses)

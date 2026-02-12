@@ -54,6 +54,9 @@ docker run --platform=linux/amd64 -p 8080:8080 --env-file .env bookkeeper-api:la
 ```bash
 # Push image to ACR
 docker build --platform=linux/amd64 -t <ACR>.azurecr.io/bookkeeper-api:latest .
+# Login to ACR
+az acr login -n <ACR>
+# Push image
 docker push <ACR>.azurecr.io/bookkeeper-api:latest
 
 # Create env (once)

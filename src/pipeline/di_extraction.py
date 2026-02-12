@@ -4,7 +4,8 @@ from typing import List, Tuple, Any
 import logging
 
 from azure.core.polling import LROPoller
-from src.config.azure_clients import credential, di_endpoint, di_api_version
+from src.config.azure_clients import di_credential, di_endpoint, di_api_version
+from azure.ai.documentintelligence.aio import DocumentIntelligenceClient
 
 logger = logging.getLogger(__name__)
 logger.info("[DI] di_extraction module loaded (endpoint=%s api_version=%s)", di_endpoint, di_api_version)
@@ -27,10 +28,9 @@ async def extract_with_azure_di(local_file_path: str, file_url: str | None = Non
         markdown_content    -> Full document markdown
     """
 
-    from azure.ai.documentintelligence.aio import DocumentIntelligenceClient
     async with DocumentIntelligenceClient(
         endpoint=di_endpoint,
-        credential=credential,
+        credential=di_credential,
         api_version=di_api_version,
     ) as client:
         if file_url:

@@ -117,26 +117,39 @@ app = FastAPI(title="Bookkeeper API", version="1.0.0")
 
 # Security: tightened CORS for production
 allowed_origins_str = os.getenv("ALLOWED_ORIGINS", "")
-if allowed_origins_str:
-    allowed_origins = [o.strip() for o in allowed_origins_str.split(",") if o.strip()]
-else:
-    # Fallback to localhost for dev if not set
-    allowed_origins = [
-        "http://localhost:3000", 
-        "http://127.0.0.1:3000",
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:5174",
-        "http://127.0.0.1:5174",
-    ]
+allowed_origin_regex = os.getenv("ALLOWED_ORIGIN_REGEX", "")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=allowed_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+if allowed_origin_regex:
+    # Most flexible production setting (e.g. allowing any azure website)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origin_regex=allowed_origin_regex,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+else:
+    if allowed_origins_str:
+        allowed_origins = [o.strip() for o in allowed_origins_str.split(",") if o.strip()]
+    else:
+        # Fallback defaults
+        allowed_origins = [
+            "http://localhost:3000", 
+            "http://127.0.0.1:3000",
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+            "http://localhost:5174",
+            "http://127.0.0.1:5174",
+            "https://blackbox-ai-dwhqeffsake0bfdk.canadacentral-01.azurewebsites.net"
+        ]
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=allowed_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 # Global Error Handlers
 from fastapi.exceptions import RequestValidationError
@@ -411,8 +424,10 @@ async def upload_document(
                 progress_cb=_progress,
                 llm_provider=llm_provider
             )
+            # Retrieve doc_id from meta since it's nested there
+            meta = result.get("meta", {})
             _metrics['documents_total'] += 1
-            _set_job(job_id, status="completed", message="Completed", doc_id=result.get("doc_id"), meta=result.get("meta"))
+            _set_job(job_id, status="completed", message="Completed", doc_id=meta.get("doc_id"), meta=meta)
         except Exception as e:
             logger.exception("Pipeline failed")
             _metrics['documents_failed'] += 1
