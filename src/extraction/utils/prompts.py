@@ -116,19 +116,68 @@ def build_medical_prompts(chunk_content: str, prior_context: str = "") -> Tuple[
             logger.error(f"Failed to format medical override prompt: {e}. Falling back.")
 
     system_prompt = """You are a specialized tax assistant for Canadian Personal Income Tax (CRA).
-Your task is to extract ELIGIBLE MEDICAL EXPENSES for the Medical Expense Tax Credit.
+Your task is to extract ELIGIBLE MEDICAL EXPENSES for the Medical Expense Tax Credit using a STRICT PAGE-WISE approach.
 
-RULES:
-1. Extract transaction DATE, AMOUNT, VENDOR (Payee/Provider), and DESCRIPTION.
-2. Determine ELIGIBILITY based on CRA rules (Prescriptions, Dental, Vision, Health Plans = YES).
-   - Cosmetic procedures, gym memberships, over-the-counter vitamins = NO.
-3. IGNORE headers, footers, and non-transaction text.
-4. If a transaction is a "Balance Forward" or "Previous Balance", IGNORE IT (flag as duplicate or omit).
-5. For INSURANCE STATEMENTS: Only extract the "Patient Pays" or "Amount You Paid" column. Do NOT extract the total billed amount if it was covered.
+PRIMARY OBJECTIVE:
+Perform a page-by-page extraction where EACH page in the document gets its own separate extraction record. Do NOT consolidate transactions across pages. Extract exactly what is documented on each individual page.
+
+PAGE-WISE EXTRACTION RULES:
+1. ONE RECORD PER PAGE: Every page should have Exactly One extraction entry.
+2. AMOUNT EXTRACTION:
+   - Extract the specific amount shown on the current page.
+   - If Page X is a prescription label showing "Patient Pays: $2.83", extract $2.83 for Page X.
+   - If Page Y is a terminal/Visa receipt showing "Total: $14.83", extract $14.83 for Page Y.
+   - Do NOT sum pages together or try to "consolidate" them into one record. The user wants to see the raw data per page.
+3. LINKING & RELATIONSHIPS:
+   - Use the 'comments' and 'duplicate_reference' fields to explain relationships.
+   - If Page 4 is a payment for items on Pages 1 and 3, extract the amount for Page 4 and add comment: "Total payment for pages 1 and 3".
+4. CATEGORIZATION:
+   - Assign the most specific category to each page.
+   - Payment receipts without item details should be categorized as "Payment Confirmation" or the broad medical category.
+
+Example for Pages 1-4:
+- Page 1 (Prescription Label): {"amount": 2.83, "page_numbers": [1], "comments": "Prescription item"}
+- Page 2 (Blank): {"amount": null, "page_numbers": [2], "expense_type": "Irrelevant / Non-medical"}
+- Page 3 (Receipt for Kit): {"amount": 12.00, "page_numbers": [3], "comments": "Surgical kit item"}
+- Page 4 (Visa Terminal Receipt): {"amount": 14.83, "page_numbers": [4], "comments": "Total payment for pages 1 and 3"}
+
+ELIGIBILITY RULES:
+Mark eligible=true when:
+- Prescriptions, Dental, Vision care, Physiotherapy, Chiropractic, Registered Massage Therapy
+- Medical devices, hearing aids, glasses/contacts
+- Lab work, diagnostic tests
+- Hospital services, clinic fees
+
+Mark eligible=false when:
+- Cosmetic procedures (unless medically necessary)
+- Gym memberships, fitness classes
+- Over-the-counter vitamins/supplements (unless prescribed)
+- Appointment reminders, lab results (non-financial pages)
+- PARKING for medical visits if distance < 80km one-way from home
+
+MEDICAL TRAVEL & PARKING (Ontario/CRA Rules):
+- Parking is eligible ONLY if distance traveled is 80 km or more one-way.
+- For parking receipts: Mark eligible=false if distance < 80km, add comment explaining.
+
+DUPLICATE DETECTION:
+- Use 'duplicate_reference' to indicate if a page is a direct duplicate of another page (e.g., same receipt scanned twice).
+- If one page is an itemized bill and another is a payment for it, they are NOT duplicates in the page-wise view; they are different pieces of evidence for the same transaction. Use comments to link them.
+
+DATE FORMAT:
+- Use DD-MM-YYYY whenever possible.
+
+RX_NUMBER:
+- Capture prescription number if shown on the page.
+
+COMMENTS REQUIREMENTS:
+Explain:
+- Why something is ineligible.
+- Relationships between pages (e.g., "This payment confirms items on pages X and Y").
+- If the page is a continuation or blank.
 """
     
     user_prompt = f"""
-Analyze the following document chunk and extract medical expenses.
+Analyze the following document chunk and extract medical expenses using a STRICT PAGE-WISE approach.
 
 CONTEXT FROM PREVIOUS CHUNKS:
 {prior_context}
@@ -136,191 +185,248 @@ CONTEXT FROM PREVIOUS CHUNKS:
 DOCUMENT CHUNK:
 {chunk_content}
 
-INSTRUCTIONS:
-- Return a JSON object with a list of expenses.
-- Use explicit field names (date, amount, payee_provider, expense_type).
-- If an expense is clearly ineligible, set 'eligible' to false.
-- If unsure, set 'eligible' to null.
+CRITICAL INSTRUCTIONS:
+1. Return a JSON object with a list of expenses.
+2. Provide EXACTLY ONE extraction entry for EACH page number in this chunk.
+3. DO NOT CONSOLIDATE. If a receipt spans pages 1, 3, and 4, you must create 3 separate entries:
+   - Entry for Page 1 with its amount.
+   - Entry for Page 3 with its amount.
+   - Entry for Page 4 with its total amount.
+4. Use the 'comments' field to link these pages (e.g., "Total for pages 1 and 3").
+5. If a page is blank or irrelevant, create an entry with amount: null and expense_type: "Irrelevant".
 """
     return system_prompt, user_prompt
 
-def build_childcare_prompts(context: str) -> Tuple[str, str]:
+
+def build_childcare_prompts(chunk_content: str, prior_context: str = "") -> Tuple[str, str]:
     override = _get_prompt_override("child_care")
     if override:
         sys_tmpl, user_tmpl = override
         try:
-            return sys_tmpl, user_tmpl.format(context=context, chunk_content=context)
+            return sys_tmpl, user_tmpl.format(
+                chunk_content=chunk_content, 
+                context=chunk_content,
+                prior_context=prior_context
+            )
         except Exception:
             pass
 
-    system = "You are a tax assistant. Extract Childcare Expenses."
-    user = f"""Extract childcare receipts.
-Fields: Date, Child Name, Provider Name, City, Description, Amount.
-Content:
-{context}
+    system = """You are a tax assistant for Canadian Personal Income Tax (CRA).
+Extract CHILDCARE EXPENSES for the Childcare Expense Deduction using a STRICT PAGE-WISE approach.
+"""
+    
+    user = f"""Extract childcare expenses from the following document using a STRICT PAGE-WISE approach.
+
+CONTEXT FROM PREVIOUS CHUNKS:
+{prior_context}
+
+DOCUMENT CHUNK:
+{chunk_content}
 """
     return system, user
 
-def build_donation_prompts(context: str) -> Tuple[str, str]:
+
+def build_donation_prompts(chunk_content: str, prior_context: str = "") -> Tuple[str, str]:
     override = _get_prompt_override("donation")
     if override:
         sys_tmpl, user_tmpl = override
         try:
-            return sys_tmpl, user_tmpl.format(context=context, chunk_content=context)
+            return sys_tmpl, user_tmpl.format(
+                chunk_content=chunk_content, 
+                context=chunk_content,
+                prior_context=prior_context
+            )
         except Exception:
             pass
 
-    system = "You are a tax assistant. Extract Charitable Donations."
-    user = f"""Extract charitable donation receipts/transactions.
-Relaxed Rules:
-- Extract ANY payment that appears to be a donation or registration for a charity event.
-- Do not strictly require "Official Tax Receipt" phrasing.
-- If it's a registration fee, extract it and note in comments.
+    system = """You are a tax assistant. Extract Charitable Donations using a STRICT PAGE-WISE approach.
+"""
+    user = f"""Extract charitable donation receipts using a STRICT PAGE-WISE approach.
 
-Fields: Date, Donor, Donee (Charity), Amount.
-Content:
-{context}
+CONTEXT FROM PREVIOUS CHUNKS:
+{prior_context}
+
+DOCUMENT CHUNK:
+{chunk_content}
 """
     return system, user
 
-def build_fhsa_prompts(context: str) -> Tuple[str, str]:
+def build_fhsa_prompts(chunk_content: str, prior_context: str = "") -> Tuple[str, str]:
     override = _get_prompt_override("fhsa_contribution")
     if override:
         sys_tmpl, user_tmpl = override
         try:
-            return sys_tmpl, user_tmpl.format(context=context, chunk_content=context)
+            return sys_tmpl, user_tmpl.format(
+                chunk_content=chunk_content, 
+                context=chunk_content,
+                prior_context=prior_context
+            )
         except Exception:
             pass
 
-    system = "You are a tax assistant. Extract FHSA Contributions."
-    user = f"""Extract First Home Savings Account (FHSA) contributions.
-Fields: SIN, Amount.
-Content:
-{context}
+    system = """You are a tax assistant. Extract FHSA Contributions using a STRICT PAGE-WISE approach."""
+    user = f"""Extract First Home Savings Account (FHSA) contributions page-by-page.
+
+CONTEXT FROM PREVIOUS CHUNKS:
+{prior_context}
+
+DOCUMENT CHUNK:
+{chunk_content}
 """
     return system, user
 
-def build_slips_prompts(context: str) -> Tuple[str, str]:
+def build_slips_prompts(chunk_content: str, prior_context: str = "") -> Tuple[str, str]:
     override = _get_prompt_override("slips")
     if override:
         sys_tmpl, user_tmpl = override
         try:
-            return sys_tmpl, user_tmpl.format(context=context, chunk_content=context)
+            return sys_tmpl, user_tmpl.format(
+                chunk_content=chunk_content, 
+                context=chunk_content,
+                prior_context=prior_context
+            )
         except Exception:
             pass
 
-    system = "You are a tax assistant. Extract ALL Tax Slips (T4, T5, T3, T5008, etc.) found in the document."
+    system = """You are a tax assistant. Extract ALL Tax Slips using a STRICT PAGE-WISE approach."""
     user = f"""
-    Analyze the following content which may contain MULTIPLE tax slips (e.g. on different pages).
+    Analyze the following content and extract tax slips page-by-page.
     
-    INSTRUCTIONS:
-    1. Scan the entire text for any tax slip.
-    2. Extract EACH slip as a separate item in the list. Do not stop after the first one.
-    3. For each slip, capture:
-       - Slip Type (T4, T4A, T5, etc.)
-       - Issuer (Employer/Payer)
-       - SIN (Social Insurance Number)
-       - Box Values: Map every box number (14, 22, etc.) to its value.
+    CONTEXT FROM PREVIOUS CHUNKS:
+    {prior_context}
     
-    CRITICAL: If there are 5 pages of slips, I expect 5 items in the list.
-    
-    Content:
-    {context}
+    DOCUMENT CHUNK:
+    {chunk_content}
     """
     return system, user
 
-def build_property_tax_prompts(context: str) -> Tuple[str, str]:
+def build_property_tax_prompts(chunk_content: str, prior_context: str = "") -> Tuple[str, str]:
     override = _get_prompt_override("property_tax")
     if override:
         sys_tmpl, user_tmpl = override
         try:
-            return sys_tmpl, user_tmpl.format(context=context, chunk_content=context)
+            return sys_tmpl, user_tmpl.format(
+                chunk_content=chunk_content, 
+                context=chunk_content,
+                prior_context=prior_context
+            )
         except Exception:
             pass
 
-    system = "You are a tax assistant. Extract Property Tax Bills."
-    user = f"""Extract Final Property Tax amount.
-Fields: Address, Municipality, Roll Number, Year, Amount.
-Content:
-{context}
+    system = """You are a tax assistant for Canadian Personal Income Tax (CRA).
+Extract PROPERTY TAX BILLS using a STRICT PAGE-WISE approach.
+"""
+    
+    user = f"""Extract property tax bills using a STRICT PAGE-WISE approach.
+
+CONTEXT FROM PREVIOUS CHUNKS:
+{prior_context}
+
+DOCUMENT CHUNK:
+{chunk_content}
 """
     return system, user
 
-def build_rent_prompts(context: str) -> Tuple[str, str]:
+
+def build_rent_prompts(chunk_content: str, prior_context: str = "") -> Tuple[str, str]:
     override = _get_prompt_override("rent_receipt")
     if override:
         sys_tmpl, user_tmpl = override
         try:
-            return sys_tmpl, user_tmpl.format(context=context, chunk_content=context)
+            return sys_tmpl, user_tmpl.format(
+                chunk_content=chunk_content, 
+                context=chunk_content,
+                prior_context=prior_context
+            )
         except Exception:
             pass
 
-    system = "You are a tax assistant. Extract Rent Receipts."
-    user = f"""Extract Rent Information.
-Fields: Address, Landlord, Months Paid, Monthly Rent, Total Amount.
-Content:
-{context}
+    system = """You are a tax assistant for Canadian Personal Income Tax (CRA).
+Extract RENT RECEIPTS using a STRICT PAGE-WISE approach.
+"""
+    
+    user = f"""Extract rent receipts page-by-page.
+
+CONTEXT FROM PREVIOUS CHUNKS:
+{prior_context}
+
+DOCUMENT CHUNK:
+{chunk_content}
 """
     return system, user
 
-def build_rrsp_prompts(context: str) -> Tuple[str, str]:
+
+def build_rrsp_prompts(chunk_content: str, prior_context: str = "") -> Tuple[str, str]:
     override = _get_prompt_override("rrsp_contribution")
     if override:
         sys_tmpl, user_tmpl = override
         try:
-            return sys_tmpl, user_tmpl.format(context=context, chunk_content=context)
+            return sys_tmpl, user_tmpl.format(
+                chunk_content=chunk_content, 
+                context=chunk_content,
+                prior_context=prior_context
+            )
         except Exception:
             pass
 
-    system = "You are a tax assistant. Extract RRSP Contributions."
-    user = f"""Extract RRSP Contribution Receipts.
-Fields: SIN, First 60 Doys Amount, Rest of Year Amount, Total Amount.
-Content:
-{context}
+    system = """You are a tax assistant. Extract RRSP Contributions using a STRICT PAGE-WISE approach."""
+    user = f"""Extract RRSP Contribution Receipts page-by-page.
+
+CONTEXT FROM PREVIOUS CHUNKS:
+{prior_context}
+
+DOCUMENT CHUNK:
+{chunk_content}
 """
     return system, user
 
-def build_union_dues_prompts(context: str) -> Tuple[str, str]:
+def build_union_dues_prompts(chunk_content: str, prior_context: str = "") -> Tuple[str, str]:
     override = _get_prompt_override("union_dues")
     if override:
         sys_tmpl, user_tmpl = override
         try:
-            return sys_tmpl, user_tmpl.format(context=context, chunk_content=context)
+            return sys_tmpl, user_tmpl.format(
+                chunk_content=chunk_content, 
+                context=chunk_content,
+                prior_context=prior_context
+            )
         except Exception:
             pass
 
-    system = "You are a tax assistant. Extract Union/Professional Dues."
-    user = f"""Extract Union or Professional Dues receipts.
-Fields: Organization, Description, Amount.
-Content:
-{context}
+    system = """You are a tax assistant. Extract Union/Professional Dues using a STRICT PAGE-WISE approach."""
+    user = f"""Extract Union or Professional Dues receipts page-by-page.
+
+CONTEXT FROM PREVIOUS CHUNKS:
+{prior_context}
+
+DOCUMENT CHUNK:
+{chunk_content}
 """
     return system, user
 
-def build_other_document_prompts(context: str) -> Tuple[str, str]:
+def build_other_document_prompts(chunk_content: str, prior_context: str = "") -> Tuple[str, str]:
     override = _get_prompt_override("other_docs")
     if override:
         sys_tmpl, user_tmpl = override
         try:
-            return sys_tmpl, user_tmpl.format(context=context, chunk_content=context)
+            return sys_tmpl, user_tmpl.format(
+                chunk_content=chunk_content, 
+                context=chunk_content,
+                prior_context=prior_context
+            )
         except Exception:
             pass
 
-    system = "You are a tax assistant. specific for summarizing miscellaneous financial documents."
+    system = """You are a tax assistant specializing in miscellaneous financial documents.
+Perform extraction using a STRICT PAGE-WISE approach. One entry per page."""
     user = f"""
-Analyze the following document.
-It has been classified as 'Other' or 'Miscellaneous'.
-Your goal is to extract key financial information in a structured way.
+Analyze the following document page-by-page.
 
-Fields to Extract:
-- Date: The main statement date or transaction date.
-- Entity: Who is the document from? (Bank, Organization, etc.)
-- Description: What is this document? (e.g. "Annual Mortgage Statement", "Utility Bill")
-- Amount: The primary financial figure (e.g. Total Paid, Ending Balance).
-- Category Guess: What tax category might this belong to?
+CONTEXT FROM PREVIOUS CHUNKS:
+{prior_context}
 
-Content:
-{context}
+DOCUMENT CHUNK:
+{chunk_content}
 """
     return system, user
 
@@ -341,31 +447,31 @@ def get_prompts_for_category(
         sys, user = build_medical_prompts(chunk_content, prior_context)
     
     elif category == DocumentCategory.CHILD_CARE_EXPENSES:
-        sys, user = build_childcare_prompts(chunk_content)
+        sys, user = build_childcare_prompts(chunk_content, prior_context)
         
     elif category == DocumentCategory.CHARITABLE_DONATIONS:
-        sys, user = build_donation_prompts(chunk_content)
+        sys, user = build_donation_prompts(chunk_content, prior_context)
         
     elif category == DocumentCategory.FHSA_CONTRIBUTION:
-        sys, user = build_fhsa_prompts(chunk_content)
+        sys, user = build_fhsa_prompts(chunk_content, prior_context)
         
     elif category == DocumentCategory.SLIPS:
-        sys, user = build_slips_prompts(chunk_content)
+        sys, user = build_slips_prompts(chunk_content, prior_context)
         
     elif category == DocumentCategory.PROPERTY_TAX_RECEIPT:
-        sys, user = build_property_tax_prompts(chunk_content)
+        sys, user = build_property_tax_prompts(chunk_content, prior_context)
         
     elif category == DocumentCategory.RENT_RECEIPT:
-        sys, user = build_rent_prompts(chunk_content)
+        sys, user = build_rent_prompts(chunk_content, prior_context)
         
     elif category == DocumentCategory.RRSP_CONTRIBUTION:
-        sys, user = build_rrsp_prompts(chunk_content)
+        sys, user = build_rrsp_prompts(chunk_content, prior_context)
         
     elif category == DocumentCategory.UNION_PROFESSIONAL_DUES:
-        sys, user = build_union_dues_prompts(chunk_content)
+        sys, user = build_union_dues_prompts(chunk_content, prior_context)
         
     elif category == DocumentCategory.OTHER_DOCUMENTS:
-        sys, user = build_other_document_prompts(chunk_content)
+        sys, user = build_other_document_prompts(chunk_content, prior_context)
         
     else:
         sys, user = build_other_document_prompts(chunk_content)

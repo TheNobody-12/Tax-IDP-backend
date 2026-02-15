@@ -255,12 +255,15 @@ async def run(
         logger.info(f"Running processor {processor.name} for {doc_id}")
         extraction_result = await processor.process(context, output_dir, ai_client=ai_client)
         
-        # 5. Format Silver Doc
+        # 5. Format Silver Doc - PAGE-WISE OUTPUT
+        # Each page gets its own unique extraction as determined by the LLM
+        # The LLM is responsible for assigning appropriate data to each page
         silver_pages = []
         for i, txt in enumerate(page_texts):
-            # Extract items belonging to this page
             current_page = i + 1
             page_items = []
+            
+            # Find all extractions that include this page number
             for item in extraction_result.data:
                 p_nums = item.get("page_numbers")
                 if not p_nums:
@@ -268,12 +271,12 @@ async def run(
                         page_items.append(item)
                     continue
                 
-                # Safe check
+                # Check if this page is mentioned in the extraction's page_numbers
                 if isinstance(p_nums, list):
                     if any(int(p) == current_page for p in p_nums if str(p).isdigit()):
                         page_items.append(item)
-                elif int(p_nums) == current_page: # Fallback if single value
-                     page_items.append(item)
+                elif int(p_nums) == current_page:
+                    page_items.append(item)
             
             # Map to legacy silver page format for downstream compatibility
             silver_pages.append({
